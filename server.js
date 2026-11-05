@@ -1,0 +1,44 @@
+import express from 'express';
+import session from 'express-session';
+import passport from 'passport';
+import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
+import { Strategy as GithubStrategy } from 'passport-github2';
+import multer from 'multer';
+import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const app = express();
+const port = process.env.PORT || 3000;
+fs.mkdirSync('data', { recursive: true }); fs.mkdirSync('uploads', { recursive: true });
+const db = new DatabaseSync('data/studio.sqlite');
+db.exec(`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT, provider TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, filename TEXT NOT NULL, original_name TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, style TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);`);
+app.use(express.json());
+app.use(session({ secret: process.env.SESSION_SECRET || 'local-development-only-change-me', resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' } }));
+app.use(passport.initialize()); app.use(passport.session());
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser((id, done) => { try { done(null, db.prepare('SELECT * FROM users WHERE id = ?').get(id) || false); } catch(e) { done(e); } });
+const base = (process.env.BASE_URL || `http://localhost:${port}`).replace(/\/$/, '');
+function upsert(provider, profile, done) { try { const id = `${provider}:${profile.id}`; const name = profile.displayName || profile.username || 'Creator'; const email = profile.emails?.[0]?.value || ''; db.prepare('INSERT INTO users (id,name,email,provider) VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,email=excluded.email').run(id,name,email,provider); done(null, db.prepare('SELECT * FROM users WHERE id=?').get(id)); } catch(e) { done(e); } }
+if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) passport.use(new GoogleStrategy({clientID:process.env.GOOGLE_CLIENT_ID,clientSecret:process.env.GOOGLE_CLIENT_SECRET,callbackURL:`${base}/auth/google/callback`}, (_a,_r,p,d)=>upsert('google',p,d)));
+if (process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET) passport.use(new GithubStrategy({clientID:process.env.GITHUB_CLIENT_ID,clientSecret:process.env.GITHUB_CLIENT_SECRET,callbackURL:`${base}/auth/github/callback`}, (_a,_r,p,d)=>upsert('github',p,d)));
+for (const provider of ['google','github']) { app.get(`/auth/${provider}`, (req,res,next) => { if (!passport._strategy(provider)) return res.redirect('/?auth=unavailable'); passport.authenticate(provider, {scope: provider === 'google' ? ['profile','email'] : ['user:email']})(req,res,next); }); app.get(`/auth/${provider}/callback`, passport.authenticate(provider,{failureRedirect:'/?auth=failed'}), (_req,res)=>res.redirect('/?view=dashboard')); }
+app.get('/api/config', (_req,res)=>res.json({google:!!passport._strategy('google'),github:!!passport._strategy('github'),demo:process.env.ENABLE_DEMO !== 'false',generation:false,payments:false}));
+app.get('/api/me',(req,res)=>res.json({user:req.user || null}));
+app.post('/api/demo-login',(req,res,next)=>{ if(process.env.ENABLE_DEMO === 'false') return res.status(403).json({error:'Demo mode is disabled.'}); const id='demo:'+randomUUID(); db.prepare('INSERT INTO users (id,name,email,provider) VALUES (?,?,?,?)').run(id,'Demo Creator','','demo'); req.login({id},err=>err?next(err):res.json({ok:true})); });
+app.post('/api/logout',(req,res,next)=>req.logout(err=>err?next(err):req.session.destroy(()=>res.json({ok:true}))));
+const requireUser=(req,res,next)=>req.user?next():res.status(401).json({error:'Please sign in first.'});
+const upload=multer({storage:multer.diskStorage({destination:'uploads/',filename:(_req,file,cb)=>cb(null,randomUUID()+path.extname(file.originalname).toLowerCase())}),limits:{fileSize:10*1024*1024,files:10},fileFilter:(_req,file,cb)=>cb(null,['image/jpeg','image/png','image/webp'].includes(file.mimetype))});
+app.get('/api/photos',requireUser,(req,res)=>res.json(db.prepare('SELECT id,original_name,created_at FROM photos WHERE user_id=? ORDER BY created_at DESC').all(req.user.id)));
+app.post('/api/photos',requireUser,(req,res,next)=>upload.array('photos',10)(req,res,err=>{if(err)return res.status(400).json({error:err.message}); try { for(const f of req.files) db.prepare('INSERT INTO photos (id,user_id,filename,original_name) VALUES (?,?,?,?)').run(randomUUID(),req.user.id,f.filename,f.originalname); res.json({uploaded:req.files.length}); } catch(e){next(e)} }));
+app.get('/api/photos/:id',requireUser,(req,res)=>{const p=db.prepare('SELECT * FROM photos WHERE id=? AND user_id=?').get(req.params.id,req.user.id); if(!p)return res.sendStatus(404); res.sendFile(path.resolve('uploads',p.filename));});
+app.delete('/api/photos/:id',requireUser,(req,res)=>{const p=db.prepare('SELECT * FROM photos WHERE id=? AND user_id=?').get(req.params.id,req.user.id); if(!p)return res.sendStatus(404); db.prepare('DELETE FROM photos WHERE id=?').run(p.id); fs.unlink(path.resolve('uploads',p.filename),()=>{}); res.json({ok:true});});
+app.get('/api/projects',requireUser,(req,res)=>res.json(db.prepare('SELECT * FROM projects WHERE user_id=? ORDER BY created_at DESC').all(req.user.id)));
+app.post('/api/projects',requireUser,(req,res)=>{const styles=['Business','Beach','Suit & Formal','Social Profiles','Travel']; if(!styles.includes(req.body.style))return res.status(400).json({error:'Choose a valid style.'}); if(!db.prepare('SELECT COUNT(*) AS n FROM photos WHERE user_id=?').get(req.user.id).n)return res.status(400).json({error:'Upload at least one photo first.'}); const id=randomUUID(); db.prepare('INSERT INTO projects (id,user_id,style,status) VALUES (?,?,?,?)').run(id,req.user.id,req.body.style,'draft'); res.json({id,status:'draft'});});
+app.delete('/api/projects/:id',requireUser,(req,res)=>{db.prepare('DELETE FROM projects WHERE id=? AND user_id=?').run(req.params.id,req.user.id);res.json({ok:true});});
+app.use(express.static('public'));
+app.use((err,_req,res,_next)=>{console.error(err);res.status(500).json({error:'Something went wrong.'});});
+app.listen(port,'0.0.0.0',()=>console.log(`Studio running on ${port}`));
